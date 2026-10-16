@@ -1,0 +1,6 @@
+{
+  "name": "agentdeck",
+  "description": "agentdeck: a live AI-agent dashboard in a Claude Code pane",
+  "owner": { "name": "XyndoX" },
+  "plugins": [{ "name": "agentdeck", "source": "./", "description": "Live dashboard of your Claude agents, sessions and routines, rendered as real pixels in a side pane", "category": "productivity" }]
+}
