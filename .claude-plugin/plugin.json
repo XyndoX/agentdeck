@@ -1,7 +1,7 @@
 {
   "name": "agentdeck",
-  "version": "0.1.0",
-  "description": "A live AI-agent dashboard in a Claude Code pane: agent flow, tool activity (search, crawl, edits, builds, tests, computer use), every running session, and your routines",
+  "version": "0.2.0",
+  "description": "Agent deck side pane: a live graph of your agents and what each is doing (search, crawl, edits, builds, tests, computer use), every running session, and your routines",
   "author": { "name": "XyndoX" },
   "license": "MIT"
 }

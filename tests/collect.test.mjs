@@ -1,7 +1,7 @@
 // node --test tests/collect.test.mjs
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { category, fold, summary } from '../daemon/collect.mjs'
+import { category, fold, summary } from '../collector/collect.mjs'
 
 test('tool calls sort into kinds of work', () => {
   assert.equal(category('WebSearch'), 'search')

@@ -1,126 +1,84 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderChildren } from 'claude-code'
+import { agentName, agentRows, ago, C, feedRows, line, routineRows, sessionRows, short, type Cloud, type Cron, type Seg, type Snapshot } from './deck'
+import { flow, type Flow } from './flow'
+import type { CanvasProps } from './canvas'
 import type { OverlayProps } from './overlay'
 
-// The pane shows pictures of a dashboard page that a small local daemon
-// renders in headless Chrome (daemon/server.mjs). This module starts the
-// daemon if no session has yet, asks it for a view the pane's size, follows
-// the view's frames, and passes clicks, keys and the wheel back to the page.
+// A side pane in three tabs. Agents: the agent graph painted in pixels, the
+// agents as rows and the live tool feed. Sessions: every live session on the
+// machine. Routines: cloud routines, loops, background jobs, scheduled tasks,
+// launchd. The data comes from collector/feed.mjs, which reads ~/.claude.
 
 const PANE = 'agentdeck'
-const PORT = 47821
-const BASE = `http://127.0.0.1:${PORT}`
-const CSS_PER_COL = 8 // the page's CSS pixels per terminal column
-const C = { muted: '#6b6b76', err: '#f07178' }
+const ANIM_MS = 350 // packets move while an agent works
+type Tab = 'agents' | 'sessions' | 'routines'
 
 const S = {
   open: false,
-  view: '',
-  session: '',
-  sessionName: '',
-  aspect: 2.1, // a terminal cell's height over its width; `/agentdeck aspect 2.2` tunes it
-  size: { cols: 0, rows: 0 },
-  frame: null as { file: string; generation: number } | null,
-  stream: null as AsyncIterator<unknown> | null,
+  tab: 'agents' as Tab,
+  home: '', // this session
+  shown: '', // the session the Agents tab shows
+  snap: null as Snapshot | null,
+  error: '',
+  feed: null as AsyncIterator<unknown> | null,
+  feedFor: '',
+  sel: '', // an agent
+  hover: '',
+  cursor: 0, // Sessions tab
+  top: 0, // Sessions / Routines scroll
+  crons: [] as Cron[],
+  cloud: null as Cloud | null,
+  drawn: null as Flow | null,
+  listed: [] as string[], // the agent rows on screen, top down
+  box: { cols: 60, rows: 12 },
+  anim: null as { cancel: () => void } | null,
   watch: null as { cancel: () => void } | null,
-  status: 'starting the dashboard…',
 }
 const redraw = ($: EngineInterface) => $.ui.invalidate('ui.render')
-const sleep = ($: EngineInterface, ms: number) => new Promise(ok => $.clock.after(ms, () => ok(null)))
 
-const curl = ($: EngineInterface, method: string, path: string, body?: unknown) =>
-  $.process.run(['curl', '-sf', '-m', '4', '-X', method, '-H', 'content-type: application/json', '--data-binary', '@-', BASE + path], { stdin: JSON.stringify(body ?? {}), timeoutMs: 6000 })
-    .catch(() => ({ exitCode: 1, stdout: '', stderr: '' }))
+// ── data ───────────────────────────────────────────────────────────────────
 
-const ping = async ($: EngineInterface) => (await $.process.run(['curl', '-sf', '-m', '1', `${BASE}/ping`], { timeoutMs: 3000 }).catch(() => ({ exitCode: 1 }))).exitCode === 0
-
-async function ensureDaemon($: EngineInterface) {
-  if (await ping($)) return true
-  // The child lives as long as this loop: the module's life, or the daemon's.
-  void (async () => {
-    try {
-      const daemon = $.process.spawn({ argv: ['node', `${$.plugin.root}/daemon/server.mjs`], env: { AGENTDECK_PORT: String(PORT) } })
-      for await (const { text } of daemon) $.ui.log(`agentdeck daemon: ${text.trim()}`, { to: 'debug' })
-    } catch (err) {
-      S.status = `could not start the daemon (needs node ≥ 22 on PATH): ${err}`
-      redraw($)
-    }
-  })()
-  for (let i = 0; i < 30; i++) {
-    await sleep($, 200)
-    if (await ping($)) return true
-  }
-  return false
-}
-
-const pixels = () => ({ width: S.size.cols * CSS_PER_COL, height: Math.round(S.size.rows * CSS_PER_COL * S.aspect) })
-
-async function sendView($: EngineInterface) {
-  if (!S.size.cols) return false
-  const r = await curl($, 'POST', '/view', { id: S.view, session: S.session, scale: 2, ...pixels() })
-  return r.exitCode === 0
-}
-
-async function connect($: EngineInterface) {
-  if (!S.open || S.stream) return
-  if (!(await ensureDaemon($))) {
-    S.status = 'the dashboard daemon did not start; is node on PATH and Chrome installed?'
-    return redraw($)
-  }
-  if (!(await sendView($))) {
-    S.status = 'the daemon refused the view (is Chrome installed? see claude --debug)'
-    return redraw($)
-  }
-  follow($)
-  void pushCrons($)
-}
-
-// One line per frame: `frame <generation> <png path>`, or `ask <what>`.
 function follow($: EngineInterface) {
-  const stream = $.process.spawn({ argv: ['curl', '-sN', `${BASE}/frames?view=${encodeURIComponent(S.view)}`] })
-  S.stream = stream
+  if (S.feed && S.feedFor === S.shown) return
+  void S.feed?.return?.(undefined)
+  const session = S.shown
+  const feed = $.process.spawn({ argv: ['node', `${$.plugin.root}/collector/feed.mjs`, session] })
+  S.feed = feed
+  S.feedFor = session
   void (async () => {
     let buf = ''
     try {
-      for await (const { stream: pipe, text } of stream) {
-        if (pipe !== 'stdout') continue
+      for await (const { stream, text } of feed) {
+        if (stream === 'stderr') { $.ui.log(`agentdeck feed: ${text.trim()}`, { to: 'debug' }); continue }
         buf += text
         let i
         while ((i = buf.indexOf('\n')) >= 0) {
-          onLine($, buf.slice(0, i))
+          try { S.snap = JSON.parse(buf.slice(0, i)) as Snapshot; S.error = '' } catch { /* a cut line */ }
           buf = buf.slice(i + 1)
         }
+        animate($)
+        redraw($)
       }
-    } catch { /* curl gone */ }
-    if (S.stream !== stream) return
-    S.stream = null
-    // The daemon went away (the session that started it ended): start again.
-    if (S.open) {
-      S.status = 'reconnecting…'
-      await sleep($, 800)
-      void connect($)
+    } catch (err) {
+      S.error = `the collector did not start (needs node ≥ 22 on PATH): ${err}`
+      redraw($)
     }
+    if (S.feed === feed) S.feed = null
   })()
 }
 
-function onLine($: EngineInterface, line: string) {
-  const [kind, a, ...rest] = line.split(' ')
-  if (kind === 'frame') {
-    const first = !S.frame
-    S.frame = { file: rest.join(' '), generation: Number(a) }
-    S.status = ''
-    if (first) return redraw($)
-    void $.ui.blit({ requestId: PANE, key: 'deck', source: { file: S.frame.file, format: 'png', generation: S.frame.generation } })
-      .then(r => { if ('deny' in r && r.deny) redraw($) })
-  } else if (kind === 'ask' && a === 'cloud') void pushCloud($)
+// Packets only move while someone works and the graph is on screen.
+function animate($: EngineInterface) {
+  const busy = S.open && S.tab === 'agents' && !!S.snap?.session?.agentList.some(a => a.status === 'working')
+  if (busy && !S.anim) S.anim = $.clock.every(ANIM_MS, () => redraw($))
+  else if (!busy && S.anim) { S.anim.cancel(); S.anim = null }
 }
 
-async function pushCrons($: EngineInterface) {
+async function loadCrons($: EngineInterface) {
   try {
     const r = await $.tool.call({ tool: 'CronList' })
-    if (!('result' in r) || !r.result || r.isError) return
-    const crons = r.result.jobs.map(j => ({ id: j.id, prompt: j.prompt, schedule: j.humanSchedule || j.cron, recurring: j.recurring }))
-    await curl($, 'POST', '/push', { session: S.session, sessionName: S.sessionName, crons })
-  } catch { /* CronList not offered here */ }
+    if ('result' in r && r.result && !r.isError) S.crons = r.result.jobs.map(j => ({ id: j.id, prompt: j.prompt, schedule: j.humanSchedule || j.cron, recurring: j.recurring }))
+  } catch { /* not offered in this session */ }
 }
 
 type Trigger = Record<string, unknown>
@@ -135,98 +93,236 @@ export function cloudItems(json: string) {
   }))
 }
 
-// Cloud routines only reach us through the RemoteTrigger tool; asked for from
-// the page's refresh button, so a permission prompt only comes when wanted.
-async function pushCloud($: EngineInterface) {
-  let cloud: { items?: ReturnType<typeof cloudItems>; error?: string }
+// Only on `r`: RemoteTrigger may ask for permission, so it runs when asked.
+async function loadCloud($: EngineInterface) {
+  S.cloud = { ...(S.cloud ?? {}), error: undefined }
   try {
     const r = await $.tool.call({ tool: 'RemoteTrigger', action: 'list' })
-    if ('deny' in r && r.deny) cloud = { error: `not allowed: ${r.deny}` }
-    else if (!r.result || r.isError) cloud = { error: 'RemoteTrigger failed (are you logged in to claude.ai?)' }
-    else cloud = r.result.status >= 400 ? { error: `claude.ai answered ${r.result.status}` } : { items: cloudItems(r.result.json) }
+    if ('deny' in r && r.deny) S.cloud = { at: Date.now(), error: `not allowed: ${r.deny}` }
+    else if (!r.result || r.isError) S.cloud = { at: Date.now(), error: 'RemoteTrigger failed (logged in to claude.ai?)' }
+    else S.cloud = r.result.status >= 400 ? { at: Date.now(), error: `claude.ai answered ${r.result.status}` } : { at: Date.now(), items: cloudItems(r.result.json) }
   } catch (err) {
-    cloud = { error: `RemoteTrigger is not available here: ${err}` }
+    S.cloud = { at: Date.now(), error: `RemoteTrigger is not available here: ${err}` }
   }
-  await curl($, 'POST', '/push', { cloud })
+  redraw($)
 }
 
-async function openPane($: EngineInterface) {
+function show($: EngineInterface, session: string) {
+  S.shown = session
+  S.sel = ''
+  S.tab = 'agents'
+  follow($)
+}
+
+async function key($: EngineInterface, k: string) {
+  const ss = S.snap?.sessions ?? []
+  if (k === '1') S.tab = 'agents'
+  else if (k === '2') S.tab = 'sessions'
+  else if (k === '3') S.tab = 'routines'
+  else if (k === 'tab') S.tab = S.tab === 'agents' ? 'sessions' : S.tab === 'sessions' ? 'routines' : 'agents'
+  else if (k === 'escape') { if (S.sel) S.sel = ''; else show($, S.home) }
+  else if (k === 'r' && S.tab === 'routines') { void loadCrons($); void loadCloud($) }
+  else if (S.tab === 'sessions' && (k === 'up' || k === 'k')) S.cursor = Math.max(0, S.cursor - 1)
+  else if (S.tab === 'sessions' && (k === 'down' || k === 'j')) S.cursor = Math.min(ss.length - 1, S.cursor + 1)
+  else if (S.tab === 'sessions' && k === 'return' && ss[S.cursor]) show($, ss[S.cursor]!.id)
+  else if (S.tab === 'agents' && (k === 'up' || k === 'down')) {
+    const list = S.snap?.session?.agentList ?? []
+    const i = list.findIndex(a => a.id === S.sel)
+    S.sel = list[Math.max(0, Math.min(list.length - 1, i + (k === 'up' ? -1 : 1)))]?.id ?? ''
+  }
+  animate($)
+  redraw($)
+}
+
+async function openPane($: EngineInterface, tab?: Tab) {
+  S.home ||= await $.session.id()
+  S.shown ||= S.home
+  if (tab) S.tab = tab
   S.open = true
-  S.session = await $.session.id()
-  S.view ||= `${S.session.slice(0, 8)}-${Math.random().toString(36).slice(2, 7)}`
-  const stored = (await $.store.get('aspect')) as number | undefined
-  if (stored) S.aspect = stored
-  await $.ui.open({ id: PANE, title: 'Agent Deck', focus: true, columns: 72 })
-  void connect($)
-  // A closed pane frees its Chrome tab.
+  await $.ui.open({ id: PANE, title: 'Agent deck', focus: true, rows: 40, columns: 80 })
+  follow($)
+  void loadCrons($)
   S.watch ??= $.clock.every(5000, () => void (async () => {
     if ((await $.ui.panes()).some(p => p.id === PANE)) return
+    // Closed: stop reading and painting until it opens again.
     S.open = false
     S.watch?.cancel()
     S.watch = null
-    const stream = S.stream
-    S.stream = null
-    await stream?.return?.(undefined)
-    S.frame = null
-    await curl($, 'DELETE', `/view?view=${encodeURIComponent(S.view)}`)
+    animate($)
+    const feed = S.feed
+    S.feed = null
+    await feed?.return?.(undefined)
   })())
 }
+
+// The picture goes to the terminal as a file it reads itself (two take turns),
+// as in repograph; without a shell it goes inline.
+const RUN_ID = Math.random().toString(36).slice(2, 8)
+const pic = { key: '', ready: null as null | { file: string; width: number; height: number; generation: number }, gen: 0, inline: false, writing: false }
+async function ensurePicture($: EngineInterface, img: Flow['image']) {
+  if (pic.key === img.key || pic.inline || pic.writing) return
+  pic.writing = true
+  const gen = pic.gen + 1
+  try {
+    const tmp = ((await $.env.get('TMPDIR')) || '/tmp').replace(/\/$/, '')
+    const file = `${tmp}/agentdeck-${RUN_ID}-${gen % 2}.rgba`
+    const r = await $.process.run(['/bin/sh', '-c', 'base64 -d > "$1"', 'sh', file], { stdin: img.rgba, timeoutMs: 10_000 })
+    if (r.exitCode !== 0) throw new Error(r.stderr)
+    pic.key = img.key
+    pic.gen = gen
+    pic.ready = { file, width: img.width, height: img.height, generation: gen }
+  } catch {
+    pic.inline = true
+  } finally {
+    pic.writing = false
+  }
+  redraw($)
+}
+
+// ── hooks ──────────────────────────────────────────────────────────────────
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const r = await next(e)
-    await $.command.register({ name: 'agentdeck', description: 'Live agent dashboard in a pane: agent flow, tools, all sessions, routines; args: [aspect <n>]' })
+    await $.command.register({ name: 'agentdeck', description: 'Agent deck: your agents, all sessions and routines in a side pane; args: [agents|sessions|routines]' })
     return r
   })
 
   on('command.run', { command: 'agentdeck' }, async ($, e) => {
-    const [arg, value] = (e.args ?? '').trim().split(/\s+/)
-    if (arg === 'aspect') {
-      const n = Number(value)
-      if (!(n > 1 && n < 4)) return { text: `agentdeck: cell aspect is ${S.aspect}; give a number between 1 and 4, e.g. /agentdeck aspect 2.2` }
-      S.aspect = n
-      await $.store.set('aspect', n)
-      if (S.open) void sendView($)
-      return { text: `agentdeck: cell aspect ${n}` }
-    }
-    await openPane($)
-    return { text: 'agentdeck: click the pane to use it. Keys: 1 session · 2 global · 3 routines · esc back to this session' }
+    const arg = (e.args ?? '').trim().toLowerCase()
+    await openPane($, arg === 'sessions' || arg === 'routines' || arg === 'agents' ? arg : undefined)
+    return { text: 'agentdeck: click the pane, then 1 agents · 2 sessions · 3 routines' }
   })
 
   on('ui.message', async ($, e, next) => {
-    if (e.requestId !== PANE || e.element !== 'input' || !e.data || typeof e.data !== 'object') return next(e)
-    void curl($, 'POST', `/input?view=${encodeURIComponent(S.view)}`, e.data)
+    if (e.requestId !== PANE || !['graph', 'agents', 'feed', 'list'].includes(String(e.element)) || !e.data || typeof e.data !== 'object') return next(e)
+    const data = e.data as { key?: string; press?: [number, number]; click?: [number, number]; hover?: [number, number] | null }
+    if (typeof data.key === 'string') await key($, data.key)
+    else if (data.press && e.element === 'graph') {
+      const id = S.drawn?.hit(data.press[0], data.press[1]) ?? ''
+      S.sel = id && id !== S.sel ? id : ''
+      redraw($)
+    } else if ('hover' in data && e.element === 'graph') {
+      const id = data.hover ? (S.drawn?.hit(data.hover[0], data.hover[1]) ?? '') : ''
+      if (id !== S.hover) { S.hover = id; redraw($) }
+    } else if (data.click && e.element === 'agents') {
+      const row = Math.floor(data.click[1])
+      const a = S.snap?.session?.agentList.find(x => x.id === S.listed[row])
+      S.sel = a && a.id !== S.sel ? a.id : ''
+      redraw($)
+    } else if (data.click && e.element === 'list' && S.tab === 'sessions') {
+      const i = Math.floor((S.top + data.click[1]) / 2)
+      const s = S.snap?.sessions[i]
+      if (s && i === S.cursor) show($, s.id)
+      else if (s) S.cursor = i
+      redraw($)
+    }
     return {}
   })
 
   on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    void curl($, 'POST', `/input?view=${encodeURIComponent(S.view)}`, { type: 'wheel', x: 0.5, y: 0.5, dy: e.by * 60 })
+    if (S.tab !== 'agents') { S.top = Math.max(0, S.top + Math.sign(e.by) * 2); redraw($) }
     return {}
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     if (e.surface !== 'terminal') return next(e)
-    const { Box, Text, Client, Image } = $.ui.resolve(e)
-    const cols = Math.max(30, Math.min(255, (e.props?.bodyColumns ?? 72) - 1))
-    const rows = Math.max(10, Math.min(255, e.props?.scroll?.bodyRows ?? 40))
-    if (cols !== S.size.cols || rows !== S.size.rows) {
-      S.size = { cols, rows }
-      if (S.open) void sendView($)
-    }
-    if (!S.frame) {
-      return (
-        <Box flexDirection="column" minHeight={rows}>
-          <Text color={S.status.startsWith('could') || S.status.startsWith('the ') ? C.err : C.muted}>{S.status || 'waiting for the first frame…'}</Text>
-        </Box>
-      )
-    }
-    return (
-      <Box key="stage" position="relative" width={cols} height={rows}>
-        <Image key="deck" source={{ file: S.frame.file, format: 'png', generation: S.frame.generation }} columns={cols} rows={rows} alt="agentdeck dashboard (needs a kitty-graphics terminal: Ghostty, kitty, WezTerm)" />
-        <Box key="hit" position="absolute" top={0} left={0}>
-          <Client key="input" module="./overlay.tsx" props={{ cols, rows } satisfies OverlayProps} />
-        </Box>
+    const { Box, Text, Button, Client, Image } = $.ui.resolve(e)
+    const cols = Math.max(30, (e.props?.bodyColumns ?? 80) - 1)
+    const height = Math.max(14, e.props?.scroll?.bodyRows ?? 36)
+    const snap = S.snap
+    const now = snap?.now ?? Date.now()
+    const working = snap?.session?.agentList.filter(a => a.status === 'working').length ?? 0
+    const busy = snap?.sessions.filter(s => s.status === 'busy').length ?? 0
+    const tab = (id: Tab, label: string, k: string) => (
+      <Button key={`tab-${id}`} plain dimColor={S.tab !== id} label={S.tab === id ? `[ ${label} ]` : `  ${label}  `} onPress={() => void key($, k)} />
+    )
+    const header = (
+      <Box flexDirection="row">
+        {tab('agents', working ? `Agents ${working}` : 'Agents', '1')}
+        {tab('sessions', snap ? `Sessions ${busy}/${snap.sessions.length}` : 'Sessions', '2')}
+        {tab('routines', 'Routines', '3')}
+        <Box flexGrow={1} />
+        {S.tab === 'routines' ? <Button key="reload" plain dimColor label="↻" onPress={() => void key($, 'r')} /> : <Text color={snap ? C.ok : C.muted}>{snap ? '●' : '○'}</Text>}
       </Box>
+    )
+    const frame = (...body: RenderChildren[]) => (
+      <Box flexDirection="column" minHeight={height}>
+        {header}
+        {body}
+      </Box>
+    )
+    const rowsOf = (key: string, rows: Seg[][]) => <Client key={key} module="./canvas.tsx" props={{ rows } satisfies CanvasProps} />
+    const hint = (t: string) => <Text color={C.muted} wrap="truncate-end">{t}</Text>
+
+    if (!snap) return frame(<Text color={S.error ? C.err : C.muted}>{S.error || 'Reading your sessions…'}</Text>)
+
+    if (S.tab === 'sessions') {
+      const view = Math.max(2, height - 2)
+      const all = sessionRows(snap.sessions, now, cols, S.shown, S.home, S.cursor)
+      S.top = Math.max(0, Math.min(S.top, Math.max(0, all.length - view)))
+      if (S.cursor * 2 < S.top) S.top = S.cursor * 2
+      if (S.cursor * 2 + 2 > S.top + view) S.top = S.cursor * 2 + 2 - view
+      return frame(rowsOf('list', all.slice(S.top, S.top + view)), <Box flexGrow={1} />, hint('↑↓ pick · enter or click twice: show its agents · esc: this session'))
+    }
+
+    if (S.tab === 'routines') {
+      const view = Math.max(2, height - 2)
+      const all = routineRows(snap.routines, S.crons, S.cloud, now, cols)
+      S.top = Math.max(0, Math.min(S.top, Math.max(0, all.length - view)))
+      return frame(rowsOf('list', all.slice(S.top, S.top + view)), <Box flexGrow={1} />, hint('r: reload cloud routines and loops · wheel: scroll'))
+    }
+
+    // Agents tab.
+    const d = snap.session
+    if (!d) return frame(<Text color={C.muted}>{S.shown === S.home ? 'This session shows up after its first prompt.' : 'That session has ended.'}</Text>, <Box flexGrow={1} />, hint('2: sessions · esc: this session'))
+    const busyNow = d.status === 'busy'
+    const title = (
+      <Box flexDirection="row">
+        <Text color={busyNow ? C.hot : C.muted}>{busyNow ? '● ' : '○ '}</Text>
+        <Text bold color={C.white} wrap="truncate-end">{d.name}</Text>
+        <Text color={C.muted} wrap="truncate-start">{`  ${d.cwd}`}</Text>
+        <Box flexGrow={1} />
+        <Text color={C.muted}>{`${d.agentList.length} agents · ${d.agentList.reduce((n, a) => n + a.calls, 0)} calls`}</Text>
+        {S.shown !== S.home ? <Button key="home" plain dimColor label="  ⌂" onPress={() => void key($, 'escape')} /> : null}
+      </Box>
+    )
+    const agentsN = Math.min(d.agentList.length, Math.max(2, Math.floor(height / 6)))
+    const graphRows = Math.max(8, Math.min(28, Math.floor((height - 6 - agentsN) * 0.6)))
+    const feedN = Math.max(2, height - 6 - agentsN - graphRows)
+    S.box = { cols, rows: graphRows }
+    if (S.sel && !d.agentList.some(a => a.id === S.sel)) S.sel = ''
+    const f = flow(d, Date.now(), cols, graphRows, S.sel, S.hover)
+    S.drawn = f
+    void ensurePicture($, f.image)
+    const source = pic.inline ? { rgba: f.image.rgba, width: f.image.width, height: f.image.height } : pic.ready ? { ...pic.ready, format: 'rgba' as const } : null
+    const sel = d.agentList.find(a => a.id === S.sel)
+    const detail = sel
+      ? line([{ t: '▸ ', c: C.hot }, { t: agentName(sel) + ' ', c: C.white, b: true }, { t: sel.description ? sel.description + ' · ' : '', c: C.fg }, { t: sel.lastText, c: C.dim }], cols, { t: `${Math.round(sel.tokensOut / 100) / 10}k tok · ${ago(sel.firstAt, now)}`, c: C.muted })
+      : line([{ t: f.hidden ? `+${f.hidden} older agents not drawn · ` : '', c: C.muted }, { t: 'click a node or row for details', c: C.muted }], cols)
+    // The agent list keeps the selected and the working ones in view.
+    const rows = agentRows(d, now, cols, S.sel)
+    const order = d.agentList.map((a, i) => ({ a, i })).sort((x, y) => Number(y.a.id === S.sel) - Number(x.a.id === S.sel) || Number(y.a.status === 'working') - Number(x.a.status === 'working') || x.i - y.i).slice(0, agentsN).sort((x, y) => x.i - y.i)
+    S.listed = order.map(o => o.a.id)
+    return frame(
+      title,
+      <Box key="stage" position="relative" width={cols} height={graphRows}>
+        {source ? <Image key="flow-image" source={source} columns={cols} rows={graphRows} alt="agent graph" /> : <Box width={cols} height={graphRows} />}
+        {f.labels.map((l, i) => (
+          <Box key={`l${i}`} position="absolute" top={l.y} left={l.x}>
+            <Text color={l.color} bold={l.bold}>{l.text}</Text>
+          </Box>
+        ))}
+        <Box key="hit" position="absolute" top={0} left={0}>
+          <Client key="graph" module="./overlay.tsx" props={{ cols, rows: graphRows } satisfies OverlayProps} />
+        </Box>
+      </Box>,
+      rowsOf('detail', [detail]),
+      rowsOf('agents', order.map(o => rows[o.i]!)),
+      <Text color={C.muted} wrap="truncate-end">{`─ live ${'─'.repeat(Math.max(0, cols - 7))}`}</Text>,
+      rowsOf('feed', feedRows(d, now, cols, feedN)),
+      <Box flexGrow={1} />,
+      hint(`1 agents · 2 sessions · 3 routines · ↑↓ agent · esc ${S.shown !== S.home ? 'this session' : 'clear'} · ${short(d.id, 8)}`),
     )
   })
 }
